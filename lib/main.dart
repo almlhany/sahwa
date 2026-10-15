@@ -1,533 +1,167 @@
+import 'dart:async';
 import 'dart:convert';
-import 'package:flutter/material.dart';
-import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
+import 'package:alarm/alarm.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:intl/intl.dart';
+import 'package:flutter/material.dart';
+import 'package:hijri/hijri_calendar.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
-void main() async {
+final navigatorKey = GlobalKey<NavigatorState>();
+
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const SahwaApp());
+  await Alarm.init();
+  await Store.init();
+  runApp(const AlarmApp());
 }
 
-// نموذج المنبه
-class AlarmModel {
+class Tone {
+  final String name;
+  final String path;
+  final bool builtIn;
+  Tone(this.name, this.path, {this.builtIn = false});
+  Map<String, dynamic> toJson() => {'name': name, 'path': path};
+}
+
+class AlarmItem {
+  final int id;
   int hour;
   int minute;
   String label;
-  bool isEnabled;
-  int snoozeMinutes;
-  String ringtoneName;
-  String? ringtonePath;
-  bool hasMathChallenge;
+  String tonePath;
+  bool enabled;
+  bool repeatDaily;
+  AlarmItem({required this.id, required this.hour, required this.minute, required this.label, required this.tonePath, this.enabled = true, this.repeatDaily = false});
+  Map<String, dynamic> toJson() => {'id': id, 'hour': hour, 'minute': minute, 'label': label, 'tonePath': tonePath, 'enabled': enabled, 'repeatDaily': repeatDaily};
+  factory AlarmItem.fromJson(Map<String, dynamic> j) => AlarmItem(id: j['id'], hour: j['hour'], minute: j['minute'], label: j['label'], tonePath: j['tonePath'], enabled: j['enabled'], repeatDaily: j['repeatDaily']?? false);
+}
 
-  AlarmModel({
-    required this.hour,
-    required this.minute,
-    required this.label,
-    this.isEnabled = true,
-    this.snoozeMinutes = 5,
-    this.ringtoneName = 'نغمة الصحوة الهادئة',
-    this.ringtonePath,
-    this.hasMathChallenge = false,
-  });
-
-  String get formattedTime {
-    final h = hour == 0 ? 12 : (hour > 12 ? hour - 12 : hour);
-    final m = minute.toString().padLeft(2, '0');
-    final period = hour < 12 ? 'ص' : 'م';
-    return '$h:$m $period';
+class Store {
+  static late SharedPreferences prefs;
+  static List<Tone> tones = [];
+  static List<AlarmItem> alarms = [];
+  static late Directory tonesDir;
+  static Future<void> init() async {
+    prefs = await SharedPreferences.getInstance();
+    final docs = await getApplicationDocumentsDirectory();
+    tonesDir = Directory('${docs.path}/tones');
+    await tonesDir.create(recursive: true);
+    final builtIns = <String, List<_N>>{
+      'كلاسيكي': [for (int i = 0; i < 4; i++)...[_N(1000, 0.15), _N(0, 0.1)], _N(0, 0.6)],
+      'لحن هادئ': [_N(523.25, 0.3), _N(659.25, 0.3), _N(783.99, 0.3), _N(1046.5, 0.5), _N(783.99, 0.3), _N(659.25, 0.3), _N(0, 0.6)],
+      'صاعد': [for (int i = 0; i < 8; i++) _N(500 + i * 120.0, 0.12), _N(0, 0.7)],
+      'طوارئ': [for (int i = 0; i < 4; i++)...[_N(900, 0.25), _N(700, 0.25)], _N(0, 0.5)],
+    };
+    tones = [];
+    int k = 0;
+    for (final e in builtIns.entries) {
+      final f = File('${tonesDir.path}/builtin_${k++}.wav');
+      if (!await f.exists()) await f.writeAsBytes(buildWav(e.value));
+      tones.add(Tone(e.key, f.path, builtIn: true));
+    }
+    final custom = prefs.getStringList('customTones')?? [];
+    for (final s in custom) {
+      final j = jsonDecode(s);
+      if (await File(j['path']).exists()) tones.add(Tone(j['name'], j['path']));
+    }
+    final a = prefs.getStringList('alarms')?? [];
+    alarms = a.map((s) => AlarmItem.fromJson(jsonDecode(s))).toList();
   }
-
-  Map<String, dynamic> toMap() => {
-        'hour': hour,
-        'minute': minute,
-        'label': label,
-        'isEnabled': isEnabled,
-        'snoozeMinutes': snoozeMinutes,
-        'ringtoneName': ringtoneName,
-        'ringtonePath': ringtonePath,
-        'hasMathChallenge': hasMathChallenge,
-      };
-
-  // [إصلاح] قيم افتراضية لتجنب الانهيار إذا كانت البيانات ناقصة
-  factory AlarmModel.fromMap(Map<String, dynamic> map) => AlarmModel(
-        hour: map['hour'] ?? 6,
-        minute: map['minute'] ?? 0,
-        label: map['label'] ?? 'منبه',
-        isEnabled: map['isEnabled'] ?? true,
-        snoozeMinutes: map['snoozeMinutes'] ?? 5,
-        ringtoneName: map['ringtoneName'] ?? 'نغمة الصحوة الهادئة',
-        ringtonePath: map['ringtonePath'],
-        hasMathChallenge: map['hasMathChallenge'] ?? false,
-      );
-}
-
-// نموذج المهمة اليومية
-class TaskModel {
-  String title;
-  String category;
-  bool isCompleted;
-  int streak;
-
-  TaskModel({
-    required this.title,
-    required this.category,
-    this.isCompleted = false,
-    this.streak = 1,
-  });
-
-  Map<String, dynamic> toMap() => {
-        'title': title,
-        'category': category,
-        'isCompleted': isCompleted,
-        'streak': streak,
-      };
-
-  factory TaskModel.fromMap(Map<String, dynamic> map) => TaskModel(
-        title: map['title'] ?? '',
-        category: map['category'] ?? 'عادات',
-        isCompleted: map['isCompleted'] ?? false,
-        streak: map['streak'] ?? 1,
-      );
-}
-
-class SahwaApp extends StatefulWidget {
-  const SahwaApp({super.key});
-
-  @override
-  State<SahwaApp> createState() => _SahwaAppState();
-}
-
-class _SahwaAppState extends State<SahwaApp> {
-  ThemeMode _themeMode = ThemeMode.dark; // الوضع الليلي المريح للعين افتراضياً
-
-  void toggleTheme(ThemeMode mode) {
-    setState(() {
-      _themeMode = mode;
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'صحوة - المنبه الذكي',
-      debugShowCheckedModeBanner: false,
-      // الدعم الكامل للغة العربية
-      locale: const Locale('ar', 'SA'),
-      supportedLocales: const [Locale('ar', 'SA'), Locale('en', 'US')],
-      localizationsDelegates: const [
-        GlobalMaterialLocalizations.delegate,
-        GlobalWidgetsLocalizations.delegate,
-        GlobalCupertinoLocalizations.delegate,
-      ],
-      themeMode: _themeMode,
-      theme: ThemeData(
-        useMaterial3: true,
-        brightness: Brightness.light,
-        primaryColor: const Color(0xFFF59E0B),
-        scaffoldBackgroundColor: const Color(0xFFF8FAFC),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFFF59E0B),
-          brightness: Brightness.light,
-        ),
-      ),
-      darkTheme: ThemeData(
-        useMaterial3: true,
-        brightness: Brightness.dark,
-        primaryColor: const Color(0xFFF59E0B),
-        scaffoldBackgroundColor: const Color(0xFF0F172A), // كحلي مريح للعين
-        cardColor: const Color(0xFF1E293B),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFFF59E0B),
-          brightness: Brightness.dark,
-        ),
-      ),
-      home: HomeScreen(onThemeChanged: toggleTheme, currentTheme: _themeMode),
-    );
+  static Future<void> saveAlarms() => prefs.setStringList('alarms', alarms.map((e) => jsonEncode(e.toJson())).toList());
+  static Future<void> saveTones() => prefs.setStringList('customTones', tones.where((t) =>!t.builtIn).map((e) => jsonEncode(e.toJson())).toList());
+  static Future<Tone?> pickCustomTone() async {
+    final r = await FilePicker.platform.pickFiles(type: FileType.audio);
+    if (r == null || r.files.single.path == null) return null;
+    final src = File(r.files.single.path!);
+    final name = r.files.single.name;
+    final dest = File('${tonesDir.path}/${DateTime.now().millisecondsSinceEpoch}_$name');
+    await src.copy(dest.path);
+    final tone = Tone(name.replaceAll(RegExp(r'\.[^.]+$'), ''), dest.path);
+    tones.add(tone);
+    await saveTones();
+    return tone;
   }
 }
 
-class HomeScreen extends StatefulWidget {
-  final Function(ThemeMode) onThemeChanged;
-  final ThemeMode currentTheme;
+class _N { final double f; final double d; _N(this.f, this.d); }
 
-  const HomeScreen({
-    super.key,
-    required this.onThemeChanged,
-    required this.currentTheme,
-  });
-
-  @override
-  State<HomeScreen> createState() => _HomeScreenState();
+Uint8List buildWav(List<_N> notes, {int rate = 22050}) {
+  final samples = <int>[];
+  for (final n in notes) {
+    final count = (n.d * rate).round();
+    for (int i = 0; i < count; i++) {
+      if (n.f == 0) { samples.add(0); continue; }
+      final t = i / rate;
+      final edge = min(i, count - i) / (rate * 0.01);
+      final fade = edge > 1? 1.0 : edge;
+      final v = (sin(2 * pi * n.f * t) * 0.7 + sin(2 * pi * n.f * 2 * t) * 0.2) * fade;
+      samples.add((v * 32767 * 0.8).round());
+    }
+  }
+  final data = ByteData(44 + samples.length * 2);
+  void str(int o, String s) { for (int i = 0; i < s.length; i++) data.setUint8(o + i, s.codeUnitAt(i)); }
+  str(0, 'RIFF'); data.setUint32(4, 36 + samples.length * 2, Endian.little); str(8, 'WAVE'); str(12, 'fmt '); data.setUint32(16, 16, Endian.little); data.setUint16(20, 1, Endian.little); data.setUint16(22, 1, Endian.little); data.setUint32(24, rate, Endian.little); data.setUint32(28, rate * 2, Endian.little); data.setUint16(32, 2, Endian.little); data.setUint16(34, 16, Endian.little); str(36, 'data'); data.setUint32(40, samples.length * 2, Endian.little);
+  for (int i = 0; i < samples.length; i++) data.setInt16(44 + i * 2, samples[i], Endian.little);
+  return data.buffer.asUint8List();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
-  int _currentIndex = 0;
-  List<AlarmModel> _alarms = [];
-  List<TaskModel> _tasks = [];
+DateTime nextOccurrence(int h, int m) { final now = DateTime.now(); var t = DateTime(now.year, now.month, now.day, h, m); if (!t.isAfter(now)) t = t.add(const Duration(days: 1)); return t; }
+Future<void> scheduleAlarm(AlarmItem a, {DateTime? at}) { return Alarm.set(alarmSettings: AlarmSettings(id: a.id, dateTime: at?? nextOccurrence(a.hour, a.minute), assetAudioPath: a.tonePath, loopAudio: true, vibrate: true, volume: 0.9, fadeDuration: 3.0, notificationTitle: a.label.isEmpty? 'منبه' : a.label, notificationBody: 'حان وقت المنبه', enableNotificationOnKill: true, androidFullScreenIntent: true)); }
 
-  @override
-  void initState() {
-    super.initState();
-    _loadData();
+class AlarmApp extends StatelessWidget { const AlarmApp({super.key}); @override Widget build(BuildContext context) { return MaterialApp(navigatorKey: navigatorKey, debugShowCheckedModeBanner: false, title: 'المنبه', locale: const Locale('ar'), builder: (c, child) => Directionality(textDirection: TextDirection.rtl, child: child!), theme: ThemeData(useMaterial3: true, brightness: Brightness.dark, colorSchemeSeed: Colors.teal), home: const HomePage()); } }
+const _days = ['الاثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة', 'السبت', 'الأحد'];
+const _months = ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو','يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'];
+String fmtTime(int h, int m) { final ap = h >= 12? 'م' : 'ص'; final h12 = h % 12 == 0? 12 : h % 12; return '$h12:${m.toString().padLeft(2, '0')} $ap'; }
+
+class HomePage extends StatefulWidget { const HomePage({super.key}); @override State<HomePage> createState() => _HomePageState(); }
+class _HomePageState extends State<HomePage> {
+  Timer? _timer; StreamSubscription? _ringSub; DateTime _now = DateTime.now(); bool _ringShown = false;
+  @override void initState() { super.initState(); HijriCalendar.setLocal('ar'); _timer = Timer.periodic(const Duration(seconds: 1), (_) { if (mounted) setState(() => _now = DateTime.now()); }); _init(); }
+  Future<void> _init() async { await Permission.notification.request(); await Permission.scheduleExactAlarm.request(); _ringSub = Alarm.ringStream.stream.listen(_onRing); for (final a in Store.alarms) { if (await Alarm.isRinging(a.id)) { _openRing(a.id); break; } } }
+  void _onRing(AlarmSettings s) => _openRing(s.id);
+  void _openRing(int id) { if (_ringShown) return; final idx = Store.alarms.indexWhere((e) => e.id == id); if (idx < 0) return; _ringShown = true; navigatorKey.currentState!.push(MaterialPageRoute(builder: (_) => RingScreen(item: Store.alarms[idx]))).then((_) { _ringShown = false; if (mounted) setState(() {}); }); }
+  @override void dispose() { _timer?.cancel(); _ringSub?.cancel(); super.dispose(); }
+  Future<void> _addAlarm() async { final item = await showModalBottomSheet<AlarmItem>(context: context, isScrollControlled: true, builder: (_) => const AddAlarmSheet()); if (item == null) return; Store.alarms.add(item); await Store.saveAlarms(); await scheduleAlarm(item); setState(() {}); }
+  Future<void> _toggle(AlarmItem a, bool v) async { a.enabled = v; if (v) { await scheduleAlarm(a); } else { await Alarm.stop(a.id); } await Store.saveAlarms(); setState(() {}); }
+  Future<void> _delete(AlarmItem a) async { await Alarm.stop(a.id); Store.alarms.remove(a); await Store.saveAlarms(); setState(() {}); }
+  @override Widget build(BuildContext context) {
+    final h = HijriCalendar.fromDate(_now); final greg = '${_days[_now.weekday - 1]}، ${_now.day} ${_months[_now.month - 1]} ${_now.year} م'; final hijri = '${h.hDay} ${h.longMonthName} ${h.hYear} هـ'; final hh = _now.hour % 12 == 0? 12 : _now.hour % 12;
+    return Scaffold(appBar: AppBar(title: const Text('المنبه'), centerTitle: true), floatingActionButton: FloatingActionButton.extended(onPressed: _addAlarm, icon: const Icon(Icons.add_alarm), label: const Text('منبه جديد')), body: Column(children: [const SizedBox(height: 12), Text('$hh:${_now.minute.toString().padLeft(2, '0')}:${_now.second.toString().padLeft(2, '0')} ${_now.hour >= 12? 'م' : 'ص'}', style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold), textDirection: TextDirection.ltr), const SizedBox(height: 8), Text(greg, style: const TextStyle(fontSize: 17)), const SizedBox(height: 4), Text(hijri, style: TextStyle(fontSize: 17, color: Theme.of(context).colorScheme.primary)), const Divider(height: 28), Expanded(child: Store.alarms.isEmpty? const Center(child: Text('لا توجد منبهات. اضغط "منبه جديد"')) : ListView.builder(padding: const EdgeInsets.only(bottom: 90), itemCount: Store.alarms.length, itemBuilder: (_, i) { final a = Store.alarms[i]; final toneName = Store.tones.firstWhere((t) => t.path == a.tonePath, orElse: () => Tone('نغمة', '')).name; return Dismissible(key: ValueKey(a.id), background: Container(color: Colors.red), onDismissed: (_) => _delete(a), child: ListTile(title: Text(fmtTime(a.hour, a.minute), style: const TextStyle(fontSize: 28), textDirection: TextDirection.ltr, textAlign: TextAlign.start), subtitle: Text('${a.label.isEmpty? 'منبه' : a.label} • $toneName${a.repeatDaily? ' • يوميًا' : ''}'), trailing: Switch(value: a.enabled, onChanged: (v) => _toggle(a, v)))); }))]));
   }
+}
 
-  // تحميل البيانات المحفوظة محلياً
-  Future<void> _loadData() async {
-    final prefs = await SharedPreferences.getInstance();
-    final alarmsJson = prefs.getString('saved_alarms');
-    final tasksJson = prefs.getString('saved_tasks');
-
-    // [إصلاح] التأكد أن الشاشة ما زالت موجودة قبل setState
-    if (!mounted) return;
-
-    setState(() {
-      if (alarmsJson != null && alarmsJson.isNotEmpty) {
-        try {
-          final List decoded = jsonDecode(alarmsJson);
-          _alarms = decoded
-              .map((e) => AlarmModel.fromMap(Map<String, dynamic>.from(e)))
-              .toList();
-        } catch (_) {}
-      } else {
-        // منبهات افتراضية
-        _alarms = [
-          AlarmModel(hour: 5, minute: 15, label: 'صلاة الفجر وبداية البركة'),
-          AlarmModel(hour: 7, minute: 30, label: 'الاستعداد للعمل والدراسة', hasMathChallenge: true),
-        ];
-      }
-
-      if (tasksJson != null && tasksJson.isNotEmpty) {
-        try {
-          final List decoded = jsonDecode(tasksJson);
-          _tasks = decoded
-              .map((e) => TaskModel.fromMap(Map<String, dynamic>.from(e)))
-              .toList();
-        } catch (_) {}
-      } else {
-        // مهام افتراضية
-        _tasks = [
-          TaskModel(title: 'أذكار الصباح والورد القرآني', category: 'عبادات', isCompleted: true, streak: 5),
-          TaskModel(title: 'مشي 20 دقيقة وشرب لتر ماء', category: 'صحة', streak: 3),
-          TaskModel(title: 'مراجعة أولويات اليوم', category: 'عمل', streak: 7),
-        ];
-      }
-    });
+class AddAlarmSheet extends StatefulWidget { const AddAlarmSheet({super.key}); @override State<AddAlarmSheet> createState() => _AddAlarmSheetState(); }
+class _AddAlarmSheetState extends State<AddAlarmSheet> {
+  TimeOfDay _time = TimeOfDay.now(); final _label = TextEditingController(); late String _tonePath; bool _repeat = false;
+  @override void initState() { super.initState(); _tonePath = Store.tones.first.path; }
+  @override Widget build(BuildContext context) {
+    return Padding(padding: EdgeInsets.fromLTRB(20, 20, 20, MediaQuery.of(context).viewInsets.bottom + 20), child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      ListTile(leading: const Icon(Icons.access_time), title: Text(fmtTime(_time.hour, _time.minute), style: const TextStyle(fontSize: 26), textDirection: TextDirection.ltr, textAlign: TextAlign.start), subtitle: const Text('اضغط لتغيير الوقت'), onTap: () async { final t = await showTimePicker(context: context, initialTime: _time); if (t!= null) setState(() => _time = t); }),
+      TextField(controller: _label, decoration: const InputDecoration(labelText: 'اسم المنبه', border: OutlineInputBorder())), const SizedBox(height: 12),
+      DropdownButtonFormField<String>(value: _tonePath, decoration: const InputDecoration(labelText: 'النغمة', border: OutlineInputBorder()), items: [for (final t in Store.tones) DropdownMenuItem(value: t.path, child: Text(t.name))], onChanged: (v) => setState(() => _tonePath = v!)), const SizedBox(height: 8),
+      OutlinedButton.icon(icon: const Icon(Icons.library_music), label: const Text('إضافة نغمة من الهاتف'), onPressed: () async { final t = await Store.pickCustomTone(); if (t!= null) setState(() => _tonePath = t.path); }),
+      SwitchListTile(title: const Text('تكرار يوميًا'), value: _repeat, onChanged: (v) => setState(() => _repeat = v)),
+      FilledButton(onPressed: () { Navigator.pop(context, AlarmItem(id: DateTime.now().millisecondsSinceEpoch % 2147483647, hour: _time.hour, minute: _time.minute, label: _label.text.trim(), tonePath: _tonePath, repeatDaily: _repeat)); }, child: const Text('حفظ')),
+    ])));
   }
+}
 
-  // حفظ البيانات
-  Future<void> _saveData() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('saved_alarms', jsonEncode(_alarms.map((e) => e.toMap()).toList()));
-    await prefs.setString('saved_tasks', jsonEncode(_tasks.map((e) => e.toMap()).toList()));
+class RingScreen extends StatelessWidget {
+  final AlarmItem item; const RingScreen({super.key, required this.item});
+  Future<void> _stop(BuildContext context) async { await Alarm.stop(item.id); if (item.repeatDaily) { await scheduleAlarm(item); } else { item.enabled = false; } await Store.saveAlarms(); if (context.mounted) Navigator.pop(context); }
+  Future<void> _snooze(BuildContext context) async { await Alarm.stop(item.id); await scheduleAlarm(item, at: DateTime.now().add(const Duration(minutes: 10))); if (context.mounted) Navigator.pop(context); }
+  @override Widget build(BuildContext context) {
+    return PopScope(canPop: false, child: Scaffold(body: SafeArea(child: Padding(padding: const EdgeInsets.all(24), child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      const Icon(Icons.alarm, size: 90), const SizedBox(height: 16),
+      Text(fmtTime(item.hour, item.minute), textAlign: TextAlign.center, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 56, fontWeight: FontWeight.bold)),
+      Text(item.label.isEmpty? 'منبه' : item.label, textAlign: TextAlign.center, style: const TextStyle(fontSize: 22)), const SizedBox(height: 48),
+      FilledButton.tonalIcon(style: FilledButton.styleFrom(padding: const EdgeInsets.all(20)), icon: const Icon(Icons.snooze), label: const Text('غفوة 10 دقائق', style: TextStyle(fontSize: 20)), onPressed: () => _snooze(context)), const SizedBox(height: 16),
+      FilledButton(style: FilledButton.styleFrom(padding: const EdgeInsets.all(20), backgroundColor: Colors.redAccent), onPressed: () => _stop(context), child: const Text('إيقاف', style: TextStyle(fontSize: 22))),
+    ])))));
   }
-
-  // إضافة أو تعديل منبه
-  void _openAlarmBottomSheet([AlarmModel? existing, int? index]) {
-    TimeOfDay selectedTime = existing != null
-        ? TimeOfDay(hour: existing.hour, minute: existing.minute)
-        : const TimeOfDay(hour: 6, minute: 0);
-    String label = existing?.label ?? '';
-    int snooze = existing?.snoozeMinutes ?? 5;
-    bool hasMath = existing?.hasMathChallenge ?? false;
-    String ringtoneName = existing?.ringtoneName ?? 'نغمة الصحوة الهادئة';
-    String? ringtonePath = existing?.ringtonePath;
-
-    // [إصلاح] controller واحد خارج الـ builder بدل إنشائه مع كل إعادة بناء
-    final labelController = TextEditingController(text: label)
-      ..selection = TextSelection.collapsed(offset: label.length);
-
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Theme.of(context).cardColor,
-      // [إصلاح] RoundedCornerShape غير موجودة في فلاتر → RoundedRectangleBorder
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (context, setSheetState) {
-            return Padding(
-              padding: EdgeInsets.only(
-                bottom: MediaQuery.of(context).viewInsets.bottom + 20,
-                left: 20,
-                right: 20,
-                top: 20,
-              ),
-              child: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Text(
-                      existing == null ? 'إضافة منبه جديد ⏰' : 'تعديل المنبه ⏰',
-                      style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                      textAlign: TextAlign.center,
-                    ),
-                    const SizedBox(height: 16),
-                    // اختيار الوقت
-                    ListTile(
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                      tileColor: Colors.black26,
-                      leading: const Icon(Icons.access_time, color: Color(0xFFF59E0B)),
-                      title: Text(
-                        'وقت التنبيه: ${selectedTime.format(context)}',
-                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-                      ),
-                      trailing: const Text('تغيير', style: TextStyle(color: Color(0xFFF59E0B))),
-                      onTap: () async {
-                        final picked = await showTimePicker(
-                          context: context,
-                          initialTime: selectedTime,
-                        );
-                        if (picked != null) {
-                          setSheetState(() => selectedTime = picked);
-                        }
-                      },
-                    ),
-                    const SizedBox(height: 12),
-                    // اسم المنبه
-                    TextField(
-                      controller: labelController,
-                      onChanged: (val) => label = val,
-                      decoration: InputDecoration(
-                        labelText: 'اسم المنبه',
-                        hintText: 'مثال: صلاة الفجر، العمل، الرياضة',
-                        filled: true,
-                        fillColor: Colors.black26,
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    // زر اختيار نغمة من ملفات الهاتف
-                    ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF334155),
-                        padding: const EdgeInsets.symmetric(vertical: 12),
-                      ),
-                      icon: const Icon(Icons.audiotrack, color: Color(0xFFF59E0B)),
-                      label: Text(
-                        'نغمة التنبيه: $ringtoneName 🎵',
-                        style: const TextStyle(color: Colors.white, fontSize: 13),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      onPressed: () async {
-                        // [إصلاح] try/catch حتى لا ينهار التطبيق إذا فشل اختيار الملف
-                        try {
-                          FilePickerResult? result =
-                              await FilePicker.platform.pickFiles(type: FileType.audio);
-                          if (result != null && result.files.single.path != null) {
-                            setSheetState(() {
-                              ringtonePath = result.files.single.path;
-                              ringtoneName = result.files.single.name;
-                            });
-                          }
-                        } catch (e) {
-                          if (!context.mounted) return;
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('تعذر اختيار النغمة')),
-                          );
-                        }
-                      },
-                    ),
-                    const SizedBox(height: 12),
-                    // [مضاف] مدة الغفوة (المتغير snooze كان معرّفاً ولا يُستخدم)
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text('مدة الغفوة:', style: TextStyle(fontWeight: FontWeight.bold)),
-                        DropdownButton<int>(
-                          value: snooze,
-                          underline: const SizedBox(),
-                          items: const [
-                            DropdownMenuItem(value: 5, child: Text('5 دقائق')),
-                            DropdownMenuItem(value: 10, child: Text('10 دقائق')),
-                            DropdownMenuItem(value: 15, child: Text('15 دقيقة')),
-                          ],
-                          onChanged: (v) {
-                            if (v != null) setSheetState(() => snooze = v);
-                          },
-                        ),
-                      ],
-                    ),
-                    // خيارات الغفوة وتحدي الاستيقاظ
-                    SwitchListTile(
-                      title: const Text('تحدي الاستيقاظ (حل مسألة حسابية)'),
-                      subtitle: const Text('يضمن استيقاظك التام قبل إيقاف الرنين'),
-                      value: hasMath,
-                      activeColor: const Color(0xFFF59E0B),
-                      onChanged: (val) => setSheetState(() => hasMath = val),
-                    ),
-                    const SizedBox(height: 16),
-                    ElevatedButton(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFFF59E0B),
-                        foregroundColor: Colors.black,
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                      ),
-                      child: const Text('حفظ المنبه وتفعيله', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                      onPressed: () {
-                        setState(() {
-                          final alarm = AlarmModel(
-                            hour: selectedTime.hour,
-                            minute: selectedTime.minute,
-                            label: label.isEmpty ? 'منبه' : label,
-                            // [إصلاح] الحفاظ على حالة التفعيل عند التعديل
-                            isEnabled: existing?.isEnabled ?? true,
-                            snoozeMinutes: snooze,
-                            hasMathChallenge: hasMath,
-                            ringtoneName: ringtoneName,
-                            ringtonePath: ringtonePath,
-                          );
-                          if (index != null) {
-                            _alarms[index] = alarm;
-                          } else {
-                            _alarms.add(alarm);
-                          }
-                        });
-                        // [إصلاح] الحفظ خارج setState
-                        _saveData();
-                        Navigator.pop(ctx);
-                      },
-                    ),
-                  ],
-                ),
-              ),
-            );
-          },
-        );
-      },
-    ).whenComplete(() => labelController.dispose());
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final screens = [
-      _buildAlarmsTab(),
-      _buildTasksTab(),
-      _buildStatsTab(),
-      _buildSettingsTab(),
-    ];
-
-    return Directionality(
-      // [إصلاح] ضمان اتجاه RTL للواجهة
-      textDirection: TextDirection.rtl,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('صحوة • المنبه والمهام الذكية', style: TextStyle(fontWeight: FontWeight.bold)),
-          centerTitle: true,
-          backgroundColor: Colors.transparent,
-          elevation: 0,
-        ),
-        body: screens[_currentIndex],
-        bottomNavigationBar: NavigationBar(
-          selectedIndex: _currentIndex,
-          onDestinationSelected: (idx) => setState(() => _currentIndex = idx),
-          destinations: const [
-            NavigationDestination(icon: Icon(Icons.alarm), label: 'المنبهات'),
-            NavigationDestination(icon: Icon(Icons.checklist), label: 'المهام'),
-            NavigationDestination(icon: Icon(Icons.bar_chart), label: 'الإحصائيات'),
-            NavigationDestination(icon: Icon(Icons.settings), label: 'الإعدادات'),
-          ],
-        ),
-        floatingActionButton: _currentIndex < 2
-            ? FloatingActionButton(
-                backgroundColor: const Color(0xFFF59E0B),
-                child: const Icon(Icons.add, color: Colors.black),
-                onPressed: () {
-                  if (_currentIndex == 0) {
-                    _openAlarmBottomSheet();
-                  } else {
-                    _openAddTaskDialog();
-                  }
-                },
-              )
-            : null,
-      ),
-    );
-  }
-
-  // تبويب المنبهات
-  Widget _buildAlarmsTab() {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        // بطاقة المنبه القادم
-        Card(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          color: const Color(0xFF1E293B),
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('المنبه القادم', style: TextStyle(color: Color(0xFFF59E0B), fontSize: 13)),
-                    const SizedBox(height: 4),
-                    Text(
-                      _alarms.isNotEmpty ? _alarms.first.formattedTime : '--:--',
-                      style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.white),
-                    ),
-                    Text(
-                      _alarms.isNotEmpty ? _alarms.first.label : 'لا توجد منبهات مضافة',
-                      style: const TextStyle(color: Colors.white70, fontSize: 13),
-                    ),
-                  ],
-                ),
-                const CircleAvatar(
-                  radius: 28,
-                  backgroundColor: Color(0x33F59E0B),
-                  child: Icon(Icons.notifications_active, color: Color(0xFFF59E0B), size: 28),
-                ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 20),
-        const Text('المنبهات النشطة', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-        const SizedBox(height: 10),
-        ..._alarms.asMap().entries.map((entry) {
-          final idx = entry.key;
-          final alarm = entry.value;
-          return Card(
-            margin: const EdgeInsets.only(bottom: 12),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            child: ListTile(
-              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              onTap: () => _openAlarmBottomSheet(alarm, idx),
-              title: Text(alarm.formattedTime, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
-              subtitle: Text('${alarm.label} • ${alarm.ringtoneName}'),
-              trailing: Switch(
-                value: alarm.isEnabled,
-                activeColor: const Color(0xFFF59E0B),
-                onChanged: (val) {
-                  setState(() {
-                    alarm.isEnabled = val;
-                  });
-                  _saveData();
-                },
-              ),
-            ),
-          );
-        }),
-      ],
-    );
-  }
-
-  // تبويب المهام
-  Widget _buildTasksTab() {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        ..._tasks.map((task) {
-          return Card(
-            margin: const EdgeInsets.only(bottom: 10),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-            child: CheckboxListTile(
-              activeColor: const Color(0xFFF59E0B),
-  
+}
