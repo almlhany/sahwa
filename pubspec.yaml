@@ -1,16 +1,18 @@
-name: sahwa
+name: islamic_app
+description: تطبيق القرآن الكريم والأذكار بدون إنترنت
 publish_to: 'none'
 version: 1.0.0+1
+
 environment:
-  sdk: '>=3.0.0 <4.0.0'
+  sdk: ">=3.0.0 <4.0.0"
+
 dependencies:
   flutter:
     sdk: flutter
-  alarm: 4.1.1
-  file_picker: ^8.0.0
-  hijri: ^3.0.0
-  path_provider: ^2.1.0
-  permission_handler: ^11.3.0
-  shared_preferences: ^2.2.0
+  audioplayers: ^6.0.0     # لتشغيل الصوتيات محلياً بدون إنترنت
+  shared_preferences: ^2.2.0 # لحفظ عداد التسبيح والسور المحفوظة
+
 flutter:
   uses-material-design: true
+  assets:
+    - assets/audio/        # مجلد الملفات الصوتية (مثل سورة الفاتحة mp3)
